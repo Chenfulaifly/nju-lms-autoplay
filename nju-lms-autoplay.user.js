@@ -1,11 +1,12 @@
 // ==UserScript==
 // @name         南大智汇南雍课程自动连播
 // @namespace    https://lms.nju.edu.cn/
-// @version      2.0.0
-// @description  通过平台原生播放器播放并记录时长，到 85% 后自动进入下一节；后台播放仍计入学习时长（屏蔽 blur / visibilitychange / 心跳隐身检测）。
+// @version      2.1.0
+// @description  南大 LMS + 超星学习通：屏蔽 blur / visibilitychange / 心跳隐身检测，后台继续计时；播放到 100% 后自动进入下一节。
 // @author       Codex
 // @match        https://lms.nju.edu.cn/*
 // @match        https://*.nju.edu.cn/course/*
+// @match        https://*.chaoxing.com/*
 // @grant        none
 // @run-at       document-start
 // ==/UserScript==
@@ -202,6 +203,8 @@
   }
 
   // ---- 心跳 / 进度上报请求体改写 ----
+  const IS_CHAOXING = /(^|\.)chaoxing\.com$/.test(location.hostname);
+
   const PROGRESS_URL_RE =
     /(heartbeat|progress|duration|watch|study|learn|playlog|multimedia|\/log|track|record|activity|video)/i;
 
@@ -253,6 +256,22 @@
     return changed;
   }
 
+  // 超星：把「拖动进度条」和「是否在观看」的标记改成正常观看的值
+  function patchChaoxingFlags(body) {
+    if (!IS_CHAOXING || typeof body !== 'string' || !body) return body;
+    let changed = false;
+    const next = body
+      .replace(/(^|&)isdrag=[^&]*/g, (match, prefix) => {
+        changed = true;
+        return `${prefix}isdrag=0`;
+      })
+      .replace(/(^|&)view=[^&]*/g, (match, prefix) => {
+        changed = true;
+        return `${prefix}view=1`;
+      });
+    return changed ? next : body;
+  }
+
   function patchBody(body) {
     if (typeof body !== 'string' || !body) return body;
     const trimmed = body.trim();
@@ -271,7 +290,7 @@
       return body;
     }
 
-    if (trimmed.includes('=') && /(hidden|visib|active|focus|foreground)/i.test(trimmed)) {
+    if (trimmed.includes('=') && /(hidden|visib|active|focus|foreground|isdrag)/i.test(trimmed)) {
       try {
         const params = new URLSearchParams(trimmed);
         let changed = false;
@@ -282,17 +301,19 @@
             changed = true;
           }
         });
-        if (changed) {
+        let result = changed ? params.toString() : trimmed;
+        result = patchChaoxingFlags(result);
+        if (result !== trimmed) {
           guardStats.patched += 1;
           refreshGuardStats();
-          return params.toString();
         }
+        return result;
       } catch (_) {
         /* ignore */
       }
     }
 
-    return body;
+    return patchChaoxingFlags(body);
   }
 
   function installNetworkPatch() {
@@ -388,20 +409,35 @@
   installActivityPing();
 
   /* =========================================================================
-   * 第二部分：自动连播（只在课程页生效）
+   * 第二部分：站点识别
    * ========================================================================= */
 
-  const COURSE_ID = location.pathname.match(/^\/course\/(\d+)/)?.[1];
-  if (!COURSE_ID) return;
+  const IS_TOP = (() => {
+    try {
+      return window.top === window;
+    } catch (_) {
+      return false;
+    }
+  })();
 
-  const STORAGE_KEY = `nju-lms-autoplay-v1:${COURSE_ID}`;
+  const IS_VIDEO_MODULE = /ananas\/modules|modules\/(video|audio)|knowledge\/cards|knowledge\/video/i
+    .test(location.href);
+  const COURSE_ID = /^\/course\/(\d+)/.test(location.pathname) && !IS_CHAOXING
+    ? location.pathname.match(/^\/course\/(\d+)/)?.[1]
+    : null;
+
+  if (!IS_CHAOXING && !COURSE_ID) return;
+
+  const STORAGE_KEY = COURSE_ID ? `nju-lms-autoplay-v1:${COURSE_ID}` : 'autoplay:chaoxing';
+  // 超星播放器在独立 iframe 里，那个 frame 默认就该自动播
+  const DEFAULT_ENABLED = !COURSE_ID && !IS_TOP && IS_VIDEO_MODULE;
   const PANEL_ID = 'nju-lms-autoplay-panel';
-  const DIRECTORY_PATH = `/course/${COURSE_ID}/content#/`;
-  const AUTO_ADVANCE_RATIO = 0.85;
+  const DIRECTORY_PATH = COURSE_ID ? `/course/${COURSE_ID}/content#/` : null;
+  const AUTO_ADVANCE_RATIO = 0.999; // 播到 100% 才算完成
   const PROGRESS_SYNC_DELAY_MS = 3000;
 
   let statusText = '尚未启动';
-  let statusDetail = '打开一节视频后点“开始连播”';
+  let statusDetail = COURSE_ID ? '打开一节视频后点“开始连播”' : '点“开始连播”接管当前视频';
   let playerTimer = null;
   let directoryTimer = null;
   let lastRenderedSecond = -1;
@@ -410,13 +446,13 @@
   function readState() {
     try {
       return {
-        enabled: false,
+        enabled: DEFAULT_ENABLED,
         currentId: null,
         advancePending: false,
         ...JSON.parse(localStorage.getItem(STORAGE_KEY) || '{}'),
       };
     } catch (_) {
-      return { enabled: false, currentId: null, advancePending: false };
+      return { enabled: DEFAULT_ENABLED, currentId: null, advancePending: false };
     }
   }
 
@@ -432,12 +468,13 @@
   }
 
   function currentActivityId() {
+    if (IS_CHAOXING) return null;
     if (!location.pathname.includes('/learning-activity')) return null;
     return location.hash.match(/#\/(\d+)/)?.[1] || null;
   }
 
   function isDirectoryPage() {
-    return location.pathname === `/course/${COURSE_ID}/content`;
+    return Boolean(COURSE_ID) && location.pathname === `/course/${COURSE_ID}/content`;
   }
 
   function setStatus(title, detail = '') {
@@ -462,7 +499,13 @@
       `改写 ${guardStats.patched} · 续播 ${guardStats.resumed}`;
   }
 
+  /* =========================================================================
+   * 第三部分：面板（只在顶层页面显示）
+   * ========================================================================= */
+
   function renderPanel() {
+    if (!IS_TOP) return;
+
     let panel = document.getElementById(PANEL_ID);
     if (!panel) {
       if (!document.body) return;
@@ -520,17 +563,25 @@
 
         const activityId = currentActivityId();
         writeState({ enabled: true, currentId: activityId || state.currentId, advancePending: false });
-        setStatus('连播已开启', activityId ? '正在启动当前视频…' : '正在寻找第一个未完成课程…');
-        if (activityId) attachToPlayer(true);
-        else if (isDirectoryPage()) advanceFromDirectory(false);
-        else location.href = DIRECTORY_PATH;
+        setStatus('连播已开启', '正在启动当前视频…');
+
+        if (IS_CHAOXING) {
+          attachToPlayer(true);
+        } else if (activityId) {
+          attachToPlayer(true);
+        } else if (isDirectoryPage()) {
+          advanceFromDirectory(false);
+        } else {
+          location.href = DIRECTORY_PATH;
+        }
       });
 
       panel.querySelector('[data-action="next"]').addEventListener('click', () => {
         const activityId = currentActivityId();
         writeState({ enabled: true, currentId: activityId || readState().currentId, advancePending: true });
         setStatus('即将进入下一节', '手动跳过不会修改当前课程的完成记录');
-        location.href = DIRECTORY_PATH;
+        if (IS_CHAOXING) goNext();
+        else location.href = DIRECTORY_PATH;
       });
 
       panel.querySelector('[data-action="guard"]').addEventListener('click', () => {
@@ -567,7 +618,37 @@
     setStatus(title, detail);
   }
 
+  /* =========================================================================
+   * 第四部分：播放器接管（两个站点共用）
+   * ========================================================================= */
+
+  // 超星播放器在 iframe 里，同源就直接穿进去找 video
+  function deepVideo(doc, depth) {
+    if (!doc || depth > 3) return null;
+    for (const frame of doc.querySelectorAll('iframe')) {
+      let inner = null;
+      try {
+        inner = frame.contentDocument;
+      } catch (_) {
+        continue;
+      }
+      if (!inner) continue;
+      const video = inner.querySelector('video');
+      if (video) return video;
+      const nested = deepVideo(inner, depth + 1);
+      if (nested) return nested;
+    }
+    return null;
+  }
+
+  function findVideo() {
+    const direct = document.querySelector('video');
+    if (direct) return direct;
+    return IS_CHAOXING ? deepVideo(document, 0) : null;
+  }
+
   function nativePlayButton() {
+    if (IS_CHAOXING) return null;
     return document.querySelector(
       'button.mvp-toggle-play[aria-label="播放"], .mvp-toggle-play[aria-label="播放"]'
     );
@@ -604,6 +685,22 @@
     if (!video.paused) {
       video.dataset.njuPlatformStarted = '1';
       setStatus('正在播放', `${formatTime(video.currentTime)} / ${formatTime(video.duration)}`);
+      return;
+    }
+
+    if (IS_CHAOXING) {
+      setStatus('正在启动播放器', '直接调用播放…');
+      try {
+        await video.play();
+      } catch (_) {
+        /* 自动播放被拦截，下面统一提示 */
+      }
+      if (!video.paused) {
+        video.dataset.njuPlatformStarted = '1';
+        setStatus('正在播放', `${formatTime(video.currentTime)} / ${formatTime(video.duration)}`);
+      } else {
+        setStatus('等待你点击播放', '浏览器拦截了自动播放，请点一下视频中央的播放按钮');
+      }
       return;
     }
 
@@ -648,11 +745,63 @@
       const playButton = nativePlayButton();
       if (playButton) {
         playButton.click();
-        setStatus('后台续播', '检测到播放被中断，已重新启动');
       } else {
         video.play().catch(() => {});
       }
+      setStatus('后台续播', '检测到播放被中断，已重新启动');
     }, 1200);
+  }
+
+  /* =========================================================================
+   * 第五部分：下一节
+   * ========================================================================= */
+
+  function chaoxingNextActivity() {
+    // A. 左侧目录：当前节点的下一个可点节点
+    const nodes = [...document.querySelectorAll('.posCatalog_select')];
+    if (nodes.length) {
+      const activeIndex = nodes.findIndex((node) =>
+        node.classList.contains('posCatalog_active') || node.querySelector('.posCatalog_active')
+      );
+      if (activeIndex >= 0) {
+        for (let i = activeIndex + 1; i < nodes.length; i += 1) {
+          const node = nodes[i];
+          if (node.offsetParent === null) continue; // 折叠章节里的隐藏节点
+          node.click();
+          return true;
+        }
+      }
+    }
+
+    // B. 播放器自带的「下一节」按钮
+    const button = document.querySelector('#prevNextFocusNext, .prev_next .next, a[onclick*="prevNext"]');
+    if (button) {
+      button.click();
+      return true;
+    }
+    return false;
+  }
+
+  function goNext() {
+    if (IS_CHAOXING) {
+      if (chaoxingNextActivity()) {
+        setStatus('正在进入下一节', '已触发目录跳转');
+        return;
+      }
+      // 播放器在 iframe 里时目录在顶层页面，交给顶层去点
+      if (!IS_TOP) {
+        try {
+          window.top.postMessage({ njuAutoplayNext: true }, '*');
+        } catch (_) {
+          /* ignore */
+        }
+        setStatus('正在请求翻页', '由主页面切换到下一节');
+        return;
+      }
+      setStatus('未找到下一节', '请手动点一下左侧目录里的下一节');
+      return;
+    }
+    location.href = DIRECTORY_PATH;
   }
 
   function queueNextActivity(video, activityId, reason) {
@@ -661,21 +810,41 @@
     writeState({ currentId: activityId || currentActivityId(), advancePending: true });
 
     const reachedThreshold = reason === 'threshold';
-    const delay = reachedThreshold ? PROGRESS_SYNC_DELAY_MS : 1500;
+    const delay = IS_CHAOXING
+      ? 4000
+      : reachedThreshold
+        ? PROGRESS_SYNC_DELAY_MS
+        : 1500;
+
     setStatus(
-      reachedThreshold ? '已播放到 85%' : '本节已播完',
-      `${delay / 1000} 秒后进入下一个未完成课程…`
+      reachedThreshold ? '已播放到 100%' : '本节已播完',
+      `${delay / 1000} 秒后进入下一节…`
     );
 
-    // 继续播放几秒，给平台留出上传最后一段进度的时间。
+    // 继续停留几秒，给平台留出上传最后一段进度的时间。
     window.setTimeout(() => {
       if (!readState().enabled) {
         delete video.dataset.njuAutoAdvanceQueued;
         return;
       }
-      location.href = DIRECTORY_PATH;
+
+      // 超星自带自动下一集，若平台已经自己播上了就别再点
+      if (IS_CHAOXING) {
+        const current = findVideo();
+        if (current && current !== video && !current.paused && current.currentTime > 0) {
+          delete video.dataset.njuAutoAdvanceQueued;
+          setStatus('正在播放', `${formatTime(current.currentTime)} / ${formatTime(current.duration)}`);
+          return;
+        }
+      }
+
+      goNext();
     }, delay);
   }
+
+  /* =========================================================================
+   * 第六部分：绑定与主循环
+   * ========================================================================= */
 
   function bindVideo(video, fromUserClick) {
     if (video.dataset.njuAutoPlaylistBound === '1') {
@@ -728,7 +897,7 @@
     clearInterval(playerTimer);
     const findAndBind = () => {
       if (!readState().enabled) return;
-      const video = document.querySelector('video');
+      const video = findVideo();
       if (video) {
         bindVideo(video, fromUserClick);
         fromUserClick = false;
@@ -739,6 +908,10 @@
     findAndBind();
     playerTimer = window.setInterval(findAndBind, 1000);
   }
+
+  /* =========================================================================
+   * 第七部分：南大目录翻页
+   * ========================================================================= */
 
   function activityRows() {
     return [...document.querySelectorAll('.learning-activity[id^="learning-activity-"]')]
@@ -798,8 +971,36 @@
     directoryTimer = window.setInterval(findNext, 500);
   }
 
+  /* =========================================================================
+   * 第八部分：启动
+   * ========================================================================= */
+
   function init() {
     renderPanel();
+
+    if (IS_CHAOXING) {
+      // 打开播放器内置的「自动播放下一集」，双保险
+      if (IS_TOP) {
+        try {
+          localStorage.setItem('videoAutoPlay', 'true');
+        } catch (_) {
+          /* ignore */
+        }
+        // 播放器 iframe 播完后会请求顶层翻页
+        window.addEventListener('message', (event) => {
+          const data = event.data;
+          if (!data || data.njuAutoplayNext !== true) return;
+          if (!readState().enabled) return;
+          if (chaoxingNextActivity()) setStatus('正在进入下一节', '已触发目录跳转');
+        });
+      }
+      if (readState().enabled) {
+        setStatus('连播运行中', '正在连接视频播放器…');
+        attachToPlayer(false);
+      }
+      return;
+    }
+
     const state = readState();
     if (!state.enabled) return;
 
